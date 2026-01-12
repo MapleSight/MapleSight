@@ -1,0 +1,15 @@
+{
+  "files": {
+    "main.css": "/MapleSight/static/css/main.bbd59150.css",
+    "main.js": "/MapleSight/static/js/main.b28df665.js",
+    "static/js/453.5444f773.chunk.js": "/MapleSight/static/js/453.5444f773.chunk.js",
+    "index.html": "/MapleSight/index.html",
+    "main.bbd59150.css.map": "/MapleSight/static/css/main.bbd59150.css.map",
+    "main.b28df665.js.map": "/MapleSight/static/js/main.b28df665.js.map",
+    "453.5444f773.chunk.js.map": "/MapleSight/static/js/453.5444f773.chunk.js.map"
+  },
+  "entrypoints": [
+    "static/css/main.bbd59150.css",
+    "static/js/main.b28df665.js"
+  ]
+}
