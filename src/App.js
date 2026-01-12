@@ -131,11 +131,11 @@ export default function App() {
       // ensure audio context is resumed
       ensureAudioContext();
       if (beepIntervalRef.current) return;
-      // play immediately then repeat every second
+      // play immediately then repeat every 2.5 seconds (slower alert)
       playBeep();
       const id = setInterval(() => {
         playBeep();
-      }, 1000);
+      }, 2500);
       beepIntervalRef.current = id;
     } catch (e) {
       // ignore
@@ -744,6 +744,8 @@ export default function App() {
       if (!detected) {
         if (detectionEnabled) setMyImagePresent(false);
         else setMyImagePresent(null);
+        // clear any previous match info so overlays don't persist when detection is lost
+        try { updateMatchInfo(prev => ({ ...(prev||{}), roi: null })); } catch (e) {}
       }
     } catch (e) { console.error('Frame analysis error', e); }
     finally {
