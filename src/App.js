@@ -11,6 +11,11 @@ const ROI_PCT = {
 export default function App() {
   const [isReady, setIsReady] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
+  const [gameRect, setGameRect] = useState(null); // { x,y,width,height } in canvas pixels
+  const [isSelecting, setIsSelecting] = useState(false);
+  const selectStartRef = useRef(null);
+  const [detectionRunning, setDetectionRunning] = useState(false);
+  const [detectionProgress, setDetectionProgress] = useState(0);
   const [myImagePresent, setMyImagePresent] = useState(null);
   const [workerReady, setWorkerReady] = useState(false);
   const [templateOCRText, setTemplateOCRText] = useState(null);
@@ -39,6 +44,97 @@ export default function App() {
       }
       return audioCtxRef.current;
     } catch (e) {
+      return null;
+    }
+  };
+
+  // Auto-detect game window in the current canvas using edge/contour method on a single frame
+  const detectSingleFrame = async () => {
+    try {
+      if (!window.cv) return null;
+      const cv = window.cv;
+      const canvas = canvasRef.current;
+      if (!canvas) return null;
+      const src = cv.imread(canvas);
+      const gray = new cv.Mat(); cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+      const blur = new cv.Mat(); cv.GaussianBlur(gray, blur, new cv.Size(5,5), 0);
+      const edges = new cv.Mat(); cv.Canny(blur, edges, 50, 150);
+      const contours = new cv.MatVector(); const hierarchy = new cv.Mat();
+      cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      let bestArea = 0; let bestRect = null;
+      for (let i = 0; i < contours.size(); i++) {
+        const cnt = contours.get(i);
+        const rect = cv.boundingRect(cnt);
+        const area = rect.width * rect.height;
+        // skip tiny contours
+        if (area < 5000) { cnt.delete(); continue; }
+        if (area > bestArea) {
+          bestArea = area; bestRect = rect;
+        }
+        cnt.delete();
+      }
+      // clean up
+      src.delete(); gray.delete(); blur.delete(); edges.delete(); contours.delete(); hierarchy.delete();
+      if (bestRect) {
+        // clamp within canvas
+        const gx = Math.max(0, bestRect.x), gy = Math.max(0, bestRect.y);
+        const gw = Math.min(canvas.width - gx, bestRect.width), gh = Math.min(canvas.height - gy, bestRect.height);
+        const gr = { x: gx, y: gy, width: gw, height: gh };
+        return gr;
+      }
+      return null;
+    } catch (e) {
+      console.error('detectSingleFrame error', e);
+      return null;
+    }
+  };
+
+  // Run detection across multiple frames and pick a stable rectangle (median of successful detections)
+  const aggregateDetect = async (samples = 8, delayMs = 150) => {
+    if (detectionRunning) return;
+    setDetectionRunning(true); setDetectionProgress(0);
+    const rects = [];
+    try {
+      for (let i = 0; i < samples; i++) {
+        // draw a fresh frame to canvas
+        try {
+          const canvas = canvasRef.current; const video = videoRef.current;
+          if (canvas && video) {
+            const ctx = canvas.getContext('2d'); ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          }
+        } catch (e) {}
+        const r = await detectSingleFrame();
+        if (r) rects.push(r);
+        setDetectionProgress(Math.round(((i+1)/samples)*100));
+        // small wait to allow next video frame
+        await new Promise(res => setTimeout(res, delayMs));
+      }
+      if (rects.length === 0) {
+        setDetectionRunning(false); setDetectionProgress(0); return null;
+      }
+      // compute median rectangle components to be robust to outliers
+      const xs = rects.map(r => r.x).sort((a,b)=>a-b);
+      const ys = rects.map(r => r.y).sort((a,b)=>a-b);
+      const ws = rects.map(r => r.width).sort((a,b)=>a-b);
+      const hs = rects.map(r => r.height).sort((a,b)=>a-b);
+      const mid = Math.floor(rects.length/2);
+      const medianRect = {
+        x: xs[mid], y: ys[mid], width: ws[mid], height: hs[mid]
+      };
+      // clamp and set
+      const canvas = canvasRef.current;
+      medianRect.x = Math.max(0, Math.min(canvas.width-1, medianRect.x));
+      medianRect.y = Math.max(0, Math.min(canvas.height-1, medianRect.y));
+      medianRect.width = Math.max(1, Math.min(canvas.width-medianRect.x, medianRect.width));
+      medianRect.height = Math.max(1, Math.min(canvas.height-medianRect.y, medianRect.height));
+      setGameRect(medianRect);
+      setDetectionRunning(false); setDetectionProgress(100);
+      // brief pause before clearing progress
+      setTimeout(()=>setDetectionProgress(0), 800);
+      return medianRect;
+    } catch (e) {
+      console.error('aggregateDetect error', e);
+      setDetectionRunning(false); setDetectionProgress(0);
       return null;
     }
   };
@@ -279,8 +375,17 @@ export default function App() {
   const drawROIs = (ctx, cw, ch) => {
     const roi = ROI_PCT.ATTR; if (!roi) return;
     ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255,0,0,0.8)'; ctx.font = 'bold 14px Arial'; ctx.fillStyle = 'yellow';
-    const x = Math.floor(roi.x * cw), y = Math.floor(roi.y * ch), w = Math.floor(roi.w * cw), h = Math.floor(roi.h * ch);
-    ctx.strokeRect(x, y, w, h); ctx.fillText('ATTR', x, y - 6);
+    // If a gameRect is detected, draw ROIs relative to that rect. Otherwise draw relative to whole canvas.
+    if (gameRect) {
+      const gx = gameRect.x, gy = gameRect.y, gw = gameRect.width, gh = gameRect.height;
+      const x = Math.floor(gx + roi.x * gw), y = Math.floor(gy + roi.y * gh), w = Math.floor(roi.w * gw), h = Math.floor(roi.h * gh);
+      ctx.strokeRect(x, y, w, h); ctx.fillText('ATTR', x, y - 6);
+      // draw detected game rect
+      ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(0,200,255,0.8)'; ctx.strokeRect(gx, gy, gw, gh);
+    } else {
+      const x = Math.floor(roi.x * cw), y = Math.floor(roi.y * ch), w = Math.floor(roi.w * cw), h = Math.floor(roi.h * ch);
+      ctx.strokeRect(x, y, w, h); ctx.fillText('ATTR', x, y - 6);
+    }
   };
 
   const analyzeFrame = async () => {
@@ -299,10 +404,21 @@ export default function App() {
       if (showDebug) drawROIs(ctx, cw, ch);
       const gray = track(new cv.Mat()); cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
 
-      const rect = {
-        x: Math.floor(ROI_PCT.ATTR.x * cw), y: Math.floor(ROI_PCT.ATTR.y * ch),
-        w: Math.floor(ROI_PCT.ATTR.w * cw), h: Math.floor(ROI_PCT.ATTR.h * ch)
-      };
+      // Compute ROI rectangle in canvas pixels. If gameRect detected, compute relative to it.
+      let rect;
+      if (gameRect) {
+        rect = {
+          x: Math.floor(gameRect.x + ROI_PCT.ATTR.x * gameRect.width),
+          y: Math.floor(gameRect.y + ROI_PCT.ATTR.y * gameRect.height),
+          w: Math.floor(ROI_PCT.ATTR.w * gameRect.width),
+          h: Math.floor(ROI_PCT.ATTR.h * gameRect.height)
+        };
+      } else {
+        rect = {
+          x: Math.floor(ROI_PCT.ATTR.x * cw), y: Math.floor(ROI_PCT.ATTR.y * ch),
+          w: Math.floor(ROI_PCT.ATTR.w * cw), h: Math.floor(ROI_PCT.ATTR.h * ch)
+        };
+      }
       const ax = Math.max(0, rect.x), ay = Math.max(0, rect.y);
       const aw = Math.min(rect.w, src.cols - ax), ah = Math.min(rect.h, src.rows - ay);
       let detected = false;
@@ -357,6 +473,17 @@ export default function App() {
     }
   };
 
+  // redraw canvas once when gameRect or debug toggles change so user sees updated overlay
+  useEffect(() => {
+    try {
+      const canvas = canvasRef.current; const video = videoRef.current;
+      if (!canvas || !video) return;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      if (showDebug || gameRect) drawROIs(ctx, canvas.width, canvas.height);
+    } catch (e) {}
+  }, [gameRect, showDebug]);
+
   return (
     <div className="app-container">
       <header className="header">
@@ -367,20 +494,46 @@ export default function App() {
               <div className="tagline">A lightweight MapleStory companion</div>
           </div>
         </div>
-        <div className="header-actions">
+          <div className="header-actions">
           <label className="debug-toggle">
             <input type="checkbox" checked={showDebug} onChange={(e) => setShowDebug(e.target.checked)} /> Show Debug
           </label>
           <button className="btn-capture" onClick={startScreenCapture} disabled={!isReady}>
             {isReady ? 'Select Screen' : 'Loading OpenCV...'}
           </button>
+          <button className="btn-detect" onClick={() => aggregateDetect(8, 150)} disabled={!isReady || detectionRunning} title="Auto-detect game window from the captured frame">
+            {detectionRunning ? `Detecting... ${detectionProgress}%` : 'Auto-detect Game Window'}
+          </button>
+          <button className="btn-detect" onClick={() => setGameRect(null)} disabled={!gameRect}>Clear Detection</button>
         </div>
       </header>
 
       <div className="content-grid">
         <div className="video-section">
           <div style={{ position: 'relative', width: '100%' }}>
-            <canvas ref={canvasRef} width={1280} height={720} className="canvas-display" />
+            <canvas
+              ref={canvasRef}
+              width={1280}
+              height={720}
+              className="canvas-display"
+              onMouseDown={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const x = Math.round((e.clientX - rect.left) * (e.currentTarget.width / rect.width));
+                const y = Math.round((e.clientY - rect.top) * (e.currentTarget.height / rect.height));
+                selectStartRef.current = { x, y };
+                setIsSelecting(true);
+              }}
+              onMouseMove={(e) => {
+                if (!isSelecting || !selectStartRef.current) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const x = Math.round((e.clientX - rect.left) * (e.currentTarget.width / rect.width));
+                const y = Math.round((e.clientY - rect.top) * (e.currentTarget.height / rect.height));
+                const sx = Math.min(selectStartRef.current.x, x), sy = Math.min(selectStartRef.current.y, y);
+                const sw = Math.abs(x - selectStartRef.current.x), sh = Math.abs(y - selectStartRef.current.y);
+                setGameRect({ x: sx, y: sy, width: sw, height: sh });
+              }}
+              onMouseUp={(e) => { setIsSelecting(false); selectStartRef.current = null; }}
+            />
             <video ref={videoRef} style={{ display: 'none' }} muted />
           </div>
         </div>
@@ -415,6 +568,8 @@ export default function App() {
               <div>lastScreenOCR: {lastScreenOCR ? lastScreenOCR.slice(0, 160) : '[none]'}</div>
               <div>templateLoadStatus: {templateLoadStatus}</div>
               <div>templateCandidates: {templateCandidates.join(', ')}</div>
+              <div>gameRect: {gameRect ? `${gameRect.x}x${gameRect.y} ${gameRect.width}x${gameRect.height}` : '[none]'}</div>
+              <div>detection: {detectionRunning ? `running (${detectionProgress}%)` : 'idle'}</div>
             </div>
           )}
         </div>
